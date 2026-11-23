@@ -1,6 +1,7 @@
-"""Clean raw ENTSO-E downloads into one table with 24 local hours per day.
+"""Clean raw ENTSO-E downloads into one table with 24 local hours per day, for one market (--market DE or FR).
 Applies impossible-value rules, gap filling, daylight-saving handling and causal load winsorizing."""
 
+import sys
 from pathlib import Path
 
 import polars as pl
@@ -8,8 +9,33 @@ import polars as pl
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = PROJECT_DIR / "data" / "raw" / "entsoe"
 CLEAN_DIR = PROJECT_DIR / "data" / "clean"
-LOCAL_TIMEZONE = "Europe/Berlin"
 HOLDOUT_START_YEAR = 2024
+DEFAULT_MARKET = "DE"
+
+# Per market: where its raw files are, how its outputs are named, its local time zone, generous capacity caps
+# (MW, well above installed capacity at the end of 2023) and series that do not exist in early years.
+MARKETS = {
+    "DE": {
+        # Germany predates the per-market layout, so its raw files sit directly under RAW_DIR.
+        "raw_dir": RAW_DIR,
+        "hourly_file": "de_hourly.parquet",
+        "report_prefix": "",
+        "timezone": "Europe/Berlin",
+        # Installed at the end of 2023: about 61, 8.5 and 82 GW.
+        "capacity_caps_mw": {"wind_onshore": 80_000.0, "wind_offshore": 15_000.0, "solar": 150_000.0},
+        "structural_zero_columns": [],
+    },
+    "FR": {
+        "raw_dir": RAW_DIR / "FR",
+        "hourly_file": "fr_hourly.parquet",
+        "report_prefix": "fr_",
+        "timezone": "Europe/Paris",
+        # Installed at the end of 2023: about 22, 1.5 and 19 GW.
+        "capacity_caps_mw": {"wind_onshore": 40_000.0, "wind_offshore": 10_000.0, "solar": 60_000.0},
+        # France had no offshore wind farms before 2022: missing values before the first report are zeros.
+        "structural_zero_columns": ["wind_offshore"],
+    },
+}
 
 # entsoe-py column names, mapped to clean names.
 RAW_TIMESTAMP_COLUMN = "__index_level_0__"
@@ -29,8 +55,6 @@ RENEWABLE_COLUMNS = ["wind_onshore", "wind_offshore", "solar"]
 # Harmonised day-ahead auction limits; 4,000 is the post-2022 cap, used for the whole period.
 PRICE_FLOOR = -500.0
 PRICE_CAP = 4000.0
-# Generous caps (MW) above German installed capacity at the end of 2023 (about 61, 8.5 and 82 GW).
-CAPACITY_CAPS_MW = {"wind_onshore": 80_000.0, "wind_offshore": 15_000.0, "solar": 150_000.0}
 FROZEN_RUN_HOURS = 24
 
 HOURS_PER_DAY = 24
@@ -47,15 +71,28 @@ WINSOR_MIN_DAYS = 28
 OBSERVED = "observed"
 INTERPOLATED = "interpolated"
 PREVIOUS_WEEK = "previous_week"
+STRUCTURAL_ZERO = "structural_zero"
 MISSING = "missing"
+FILL_STATUS_ORDER = [OBSERVED, INTERPOLATED, PREVIOUS_WEEK, STRUCTURAL_ZERO, MISSING]
 
 
-def read_series(series_name):
+def selected_market():
+    """Return the market code given after --market on the command line (Germany by default)."""
+    if "--market" not in sys.argv:
+        return DEFAULT_MARKET
+    market = sys.argv[sys.argv.index("--market") + 1]
+    if market not in MARKETS:
+        raise SystemExit(f"--market {market}: unknown; known markets are {list(MARKETS)}")
+    return market
+
+
+def read_series(raw_dir, series_name):
     """Return one raw series with UTC timestamps and clean column names, duplicates dropped."""
     yearly_frames = []
-    for path in sorted((RAW_DIR / series_name).glob("*.parquet")):
+    for path in sorted((raw_dir / series_name).glob("*.parquet")):
         yearly_frames.append(pl.read_parquet(path))
-    frame = pl.concat(yearly_frames, how="vertical_relaxed")
+    # Diagonal concat: a series that starts mid-period (e.g. offshore wind) is absent from early years' files.
+    frame = pl.concat(yearly_frames, how="diagonal_relaxed")
 
     renames = {RAW_TIMESTAMP_COLUMN: "timestamp"}
     renames.update(RAW_COLUMNS[series_name])
@@ -75,7 +112,7 @@ def to_hourly(frame):
     return frame.group_by_dynamic("timestamp", every="1h").agg(pl.col(value_columns).mean())
 
 
-def join_on_hourly_grid(hourly_frames):
+def join_on_hourly_grid(hourly_frames, timezone):
     """Join all series onto one complete hourly UTC grid, so missing hours become explicit nulls."""
     starts = []
     ends = []
@@ -87,7 +124,13 @@ def join_on_hourly_grid(hourly_frames):
 
     for frame in hourly_frames:
         table = table.join(frame, on="timestamp", how="left")
-    local_dates = pl.col("timestamp").dt.convert_time_zone(LOCAL_TIMEZONE).dt.date()
+    # A series a market never reports at all still gets a column, so every market has the same layout.
+    absent_columns = []
+    for column in VALUE_COLUMNS:
+        if column not in table.columns:
+            absent_columns.append(pl.lit(None, dtype=pl.Float64).alias(column))
+    table = table.with_columns(absent_columns)
+    local_dates = pl.col("timestamp").dt.convert_time_zone(timezone).dt.date()
     return table.with_columns(local_dates.alias("local_date"))
 
 
@@ -110,7 +153,7 @@ def repeated_price_day_condition():
     return pl.col("same_price_as_day_before").all().over("local_date")
 
 
-def impossible_value_rules():
+def impossible_value_rules(capacity_caps_mw):
     """Return (column, rule name, condition) for every impossible-value rule."""
     rules = [
         ("price", "below_price_floor", pl.col("price") < PRICE_FLOOR),
@@ -119,13 +162,13 @@ def impossible_value_rules():
     ]
     for column in RENEWABLE_COLUMNS:
         rules.append((column, "negative_generation", pl.col(column) < 0))
-        rules.append((column, "above_capacity_cap", pl.col(column) > CAPACITY_CAPS_MW[column]))
+        rules.append((column, "above_capacity_cap", pl.col(column) > capacity_caps_mw[column]))
     for column in FORECAST_COLUMNS:
         rules.append((column, "frozen_feed", frozen_feed_condition(column)))
     return rules
 
 
-def apply_impossible_value_rules(table):
+def apply_impossible_value_rules(table, capacity_caps_mw):
     """Set values that break a rule to null. Return the table and one row per flagged value."""
     table = add_same_price_as_day_before(table)
     flag_frames = []
@@ -133,7 +176,7 @@ def apply_impossible_value_rules(table):
     for column in VALUE_COLUMNS:
         null_conditions[column] = pl.lit(False)
 
-    for column, rule_name, condition in impossible_value_rules():
+    for column, rule_name, condition in impossible_value_rules(capacity_caps_mw):
         condition = condition.fill_null(False)
         flagged = table.filter(condition).select(
             "timestamp",
@@ -173,9 +216,9 @@ def interpolate_short_gaps(table):
     return table.with_columns(updates)
 
 
-def to_local_days(table):
+def to_local_days(table, timezone):
     """Re-index to (local date, hour 0-23): average the doubled October hour, interpolate the missing March hour."""
-    local_time = pl.col("timestamp").dt.convert_time_zone(LOCAL_TIMEZONE)
+    local_time = pl.col("timestamp").dt.convert_time_zone(timezone)
     table = table.with_columns(local_time.dt.date().alias("date"), local_time.dt.hour().alias("hour"))
 
     fill_columns = []
@@ -217,6 +260,22 @@ def fill_from_previous_week(daily):
         status = pl.when(is_medium_gap & filled.is_not_null()).then(pl.lit(PREVIOUS_WEEK))
         status = status.otherwise(pl.col(f"{column}_fill"))
         updates.append(filled.alias(column))
+        updates.append(status.alias(f"{column}_fill"))
+    return daily.with_columns(updates)
+
+
+def fill_structural_zeros(daily, columns):
+    """Set `columns` to 0 before their first observed value: the series did not exist yet (e.g. no offshore farms)."""
+    updates = []
+    for column in columns:
+        observed_dates = daily.filter(pl.col(f"{column}_fill") == OBSERVED)["date"]
+        if observed_dates.len() == 0:
+            before_first_report = pl.lit(True)
+        else:
+            before_first_report = pl.col("date") < observed_dates.min()
+        is_structural = before_first_report & pl.col(column).is_null()
+        updates.append(pl.when(is_structural).then(0.0).otherwise(pl.col(column)).alias(column))
+        status = pl.when(is_structural).then(pl.lit(STRUCTURAL_ZERO)).otherwise(pl.col(f"{column}_fill"))
         updates.append(status.alias(f"{column}_fill"))
     return daily.with_columns(updates)
 
@@ -273,7 +332,12 @@ def fill_report(daily):
     long = statuses.unpivot(index="year", variable_name="column", value_name="status")
     counts = long.group_by("year", "column", "status").len()
     report = counts.pivot(on="status", index=["year", "column"], values="len").fill_null(0)
-    return report.sort("year", "column")
+    # Fixed status order, so the report does not depend on group_by order.
+    status_columns = []
+    for status in FILL_STATUS_ORDER:
+        if status in report.columns:
+            status_columns.append(status)
+    return report.select("year", "column", *status_columns).sort("year", "column")
 
 
 def flag_counts(flags):
@@ -287,14 +351,16 @@ def development_rows(frame, year_column):
     return frame.filter(pl.col(year_column) < HOLDOUT_START_YEAR)
 
 
-def save_outputs(daily, flags):
+def save_outputs(daily, flags, config):
     """Write the clean table, fill report, flag counts and development-period flag details."""
     CLEAN_DIR.mkdir(parents=True, exist_ok=True)
-    daily.write_parquet(CLEAN_DIR / "de_hourly.parquet")
-    fill_report(daily).write_csv(CLEAN_DIR / "fill_report.csv")
-    flag_counts(flags).write_csv(CLEAN_DIR / "flag_counts.csv")
+    prefix = config["report_prefix"]
+    daily.write_parquet(CLEAN_DIR / config["hourly_file"])
+    fill_report(daily).write_csv(CLEAN_DIR / f"{prefix}fill_report.csv")
+    flag_counts(flags).write_csv(CLEAN_DIR / f"{prefix}flag_counts.csv")
     flags_with_year = flags.with_columns(pl.col("timestamp").dt.year().alias("year"))
-    development_rows(flags_with_year, "year").drop("year").write_csv(CLEAN_DIR / "impossible_values_dev.csv")
+    development_flags = development_rows(flags_with_year, "year").drop("year")
+    development_flags.write_csv(CLEAN_DIR / f"{prefix}impossible_values_dev.csv")
 
 
 def print_development_summary(daily, flags):
@@ -305,21 +371,25 @@ def print_development_summary(daily, flags):
 
 
 def main():
+    market = selected_market()
+    config = MARKETS[market]
+    print(f"cleaning {market}")
     hourly_frames = []
     for series_name in RAW_COLUMNS:
-        hourly_frames.append(to_hourly(read_series(series_name)))
+        hourly_frames.append(to_hourly(read_series(config["raw_dir"], series_name)))
 
-    hourly = join_on_hourly_grid(hourly_frames)
-    hourly, flags = apply_impossible_value_rules(hourly)
+    hourly = join_on_hourly_grid(hourly_frames, config["timezone"])
+    hourly, flags = apply_impossible_value_rules(hourly, config["capacity_caps_mw"])
     hourly = interpolate_short_gaps(hourly)
 
-    daily = to_local_days(hourly)
+    daily = to_local_days(hourly, config["timezone"])
     daily = fill_from_previous_week(daily)
+    daily = fill_structural_zeros(daily, config["structural_zero_columns"])
     daily = winsorize_load(daily)
     daily = add_renewables_total(daily)
     daily = order_columns(daily)
 
-    save_outputs(daily, flags)
+    save_outputs(daily, flags, config)
     print_development_summary(daily, flags)
 
 

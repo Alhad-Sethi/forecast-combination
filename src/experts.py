@@ -1,4 +1,4 @@
-"""Generate walk-forward forecasts from every expert and cache them in data/experts/ (`--add rf knn` appends new experts only).
+"""Generate walk-forward forecasts from every expert and cache them in data/experts/ (`--add <names>` appends new experts only).
 Each model is fit only on days before the first day it forecasts; outlier days are never training targets."""
 
 import sys
@@ -63,6 +63,9 @@ LGBM_PARAMS = {
 }
 # Same-hour copies spare the trees from learning which of 24 columns matches the target hour.
 POOLED_OWN_HOUR_INPUTS = [("price", 1), ("price", 2), ("price", 7), ("load", 0), ("renewables", 0)]
+FRENCH_OWN_HOUR_INPUTS = [("fr_price", 1), ("fr_load", 0), ("fr_renewables", 0)]
+FRENCH_LEAR_SHORT_WINDOW_DAYS = 112
+FRENCH_LEAR_LONG_WINDOW_DAYS = 728
 QUARTER_START_MONTHS = [1, 4, 7, 10]
 JANUARY = [1]
 
@@ -351,12 +354,19 @@ def all_lear_forecasts(data, first_index, end_index):
 # ---------- LightGBM ----------
 
 
+def own_hour_inputs(data):
+    """Return the (prefix, lag) blocks copied per hour: the German ones, plus the French ones if `data` has them."""
+    if "fr_price_lag1_h00" in data.feature_names:
+        return POOLED_OWN_HOUR_INPUTS + FRENCH_OWN_HOUR_INPUTS
+    return POOLED_OWN_HOUR_INPUTS
+
+
 def pooled_rows(data, days):
-    """Stack one row per (day, hour): the day's 247 inputs, hour of day, and that hour's own inputs."""
+    """Stack one row per (day, hour): all the day's inputs, hour of day, and that hour's own inputs."""
     day_inputs = np.repeat(data.features[days], HOURS_PER_DAY, axis=0)
     hours = np.tile(np.arange(HOURS_PER_DAY), len(days))
     own_hour_blocks = []
-    for prefix, lag_days in POOLED_OWN_HOUR_INPUTS:
+    for prefix, lag_days in own_hour_inputs(data):
         block = data.features[days][:, column_indices(data, lag_columns(prefix, lag_days))]
         own_hour_blocks.append(block.reshape(-1))
     return np.column_stack([day_inputs, hours, *own_hour_blocks])
@@ -489,8 +499,43 @@ def knn_forecasts(data, first_index, end_index):
 
 
 
-# Experts that `--add` can compute on their own and append to the cache.
-ADDABLE_EXPERTS = {"rf": rf_forecasts, "knn": knn_forecasts, "lgbm_change": lgbm_change_forecasts}
+# ---------- experts with French inputs ----------
+
+
+def lear_fr_short_forecasts(data, first_index, end_index):
+    """LEAR with a 112-day window; with French data it also sees the 72 French inputs."""
+    forecasts, _ = lear_forecasts(data, FRENCH_LEAR_SHORT_WINDOW_DAYS, first_index, end_index)
+    return forecasts
+
+
+def lear_fr_long_forecasts(data, first_index, end_index):
+    """LEAR with a 728-day window; with French data it also sees the 72 French inputs."""
+    forecasts, _ = lear_forecasts(data, FRENCH_LEAR_LONG_WINDOW_DAYS, first_index, end_index)
+    return forecasts
+
+
+def fill_from_twin(name, forecasts, twin_forecasts, data, first_index, end_index):
+    """Use the German-only twin's forecast on days the French-input expert could not forecast (no French data)."""
+    filled = forecasts.copy()
+    days = np.arange(first_index, end_index)
+    needs_twin = np.isnan(forecasts[days]).any(axis=1)
+    filled[days[needs_twin]] = twin_forecasts[days[needs_twin]]
+    is_development = np.array([data.dates[day] < HOLDOUT_START for day in days[needs_twin]], dtype=bool)
+    print(f"{name}: {needs_twin.sum()} days from its twin ({is_development.sum()} before the holdout)", flush=True)
+    return filled
+
+
+# Experts that `--add` can compute on their own: the function, whether it uses the French inputs,
+# and for French-input experts the German-only twin that fills days without French data.
+ADDABLE_EXPERTS = {
+    "rf": {"function": rf_forecasts, "french": False},
+    "knn": {"function": knn_forecasts, "french": False},
+    "lgbm_change": {"function": lgbm_change_forecasts, "french": False},
+    "lear_fr_112": {"function": lear_fr_short_forecasts, "french": True, "twin": "lear_112"},
+    "lear_fr_728": {"function": lear_fr_long_forecasts, "french": True, "twin": "lear_728"},
+    "lgbm_fr": {"function": lgbm_forecasts, "french": True, "twin": "lgbm"},
+    "lgbm_change_fr": {"function": lgbm_change_forecasts, "french": True, "twin": "lgbm_change"},
+}
 
 
 # ---------- output ----------
@@ -556,12 +601,42 @@ def requested_additions():
 
 
 def check_additions(names, existing_experts):
-    """Stop unless every name is an addable expert that is not cached yet."""
+    """Stop unless every name is an addable expert that is not cached yet and whose twin (if any) is cached."""
     for name in names:
         if name not in ADDABLE_EXPERTS:
             raise SystemExit(f"--add {name}: unknown; addable experts are {list(ADDABLE_EXPERTS)}")
         if name in existing_experts:
             raise SystemExit(f"--add {name}: already cached; use a full run with --overwrite to recompute it")
+        twin = ADDABLE_EXPERTS[name].get("twin")
+        if twin is not None and twin not in existing_experts:
+            raise SystemExit(f"--add {name}: its twin {twin} must be cached first")
+
+
+def cached_forecast_array(cached, expert, dates):
+    """Return one cached expert's forecasts as a (days, 24) array aligned with `dates` (NaN where absent)."""
+    rows = cached.filter(pl.col("expert") == expert)
+    positions = pl.DataFrame({"date": dates, "day_index": np.arange(len(dates))})
+    rows = rows.join(positions, on="date", how="inner")
+    array = np.full((len(dates), HOURS_PER_DAY), np.nan)
+    array[rows["day_index"].to_numpy(), rows["hour"].to_numpy()] = rows["forecast"].to_numpy()
+    return array
+
+
+def compute_addable_expert(name, german_data, french_data, twin_forecasts, first_index, end_index):
+    """Run one addable expert on its feature set; French-input experts fall back to their twin where needed."""
+    spec = ADDABLE_EXPERTS[name]
+    if not spec["french"]:
+        return timed(name, spec["function"], german_data, first_index, end_index)
+    forecasts = timed(name, spec["function"], french_data, first_index, end_index)
+    return fill_from_twin(name, forecasts, twin_forecasts, german_data, first_index, end_index)
+
+
+def needs_french_data(names):
+    """Return True if any of `names` uses the French inputs."""
+    for name in names:
+        if ADDABLE_EXPERTS[name]["french"]:
+            return True
+    return False
 
 
 def write_forecasts(frame):
@@ -576,9 +651,16 @@ def add_experts(data, names):
     existing = pl.read_parquet(FORECASTS_PATH)
     check_additions(names, set(existing["expert"].unique()))
     first_index, end_index = forecast_index_range(data)
+    french_data = None
+    if needs_french_data(names):
+        french_data = load_day_data(include_france=True)
     forecasts = {}
     for name in names:
-        forecasts[name] = timed(name, ADDABLE_EXPERTS[name], data, first_index, end_index)
+        twin_forecasts = None
+        twin = ADDABLE_EXPERTS[name].get("twin")
+        if twin is not None:
+            twin_forecasts = cached_forecast_array(existing, twin, data.dates)
+        forecasts[name] = compute_addable_expert(name, data, french_data, twin_forecasts, first_index, end_index)
     write_forecasts(pl.concat([existing, to_long(data, forecasts)]))
     return forecasts
 
@@ -593,8 +675,11 @@ def compute_all_experts(data):
     lear, penalty_log = timed("lear (5 windows)", all_lear_forecasts, data, first_index, end_index)
     forecasts.update(lear)
     forecasts["lgbm"] = timed("lgbm", lgbm_forecasts, data, first_index, end_index)
-    for name, function in ADDABLE_EXPERTS.items():
-        forecasts[name] = timed(name, function, data, first_index, end_index)
+    french_data = load_day_data(include_france=True)
+    # Dict order puts every twin before the French-input expert that needs it.
+    for name, spec in ADDABLE_EXPERTS.items():
+        twin_forecasts = forecasts.get(spec.get("twin"))
+        forecasts[name] = compute_addable_expert(name, data, french_data, twin_forecasts, first_index, end_index)
 
     EXPERTS_DIR.mkdir(parents=True, exist_ok=True)
     write_forecasts(to_long(data, forecasts))

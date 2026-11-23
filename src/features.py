@@ -12,6 +12,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 CLEAN_DIR = PROJECT_DIR / "data" / "clean"
 HOURLY_PATH = CLEAN_DIR / "de_hourly.parquet"
 FLAGS_PATH = CLEAN_DIR / "day_flags.parquet"
+FRENCH_HOURLY_PATH = CLEAN_DIR / "fr_hourly.parquet"
 
 HOURS_PER_DAY = 24
 DAYS_PER_WEEK = 7
@@ -19,6 +20,14 @@ PRICE_LAGS_DAYS = [1, 2, 3, 7]
 # Lag 0 is the delivery day itself: its load and renewables forecasts are published on d-1.
 FUNDAMENTAL_LAGS_DAYS = [0, 1, 7]
 FUNDAMENTAL_COLUMNS = {"load": "load_forecast_winsorized", "renewables": "renewables_total"}
+# French inputs as (prefix, clean column, lag in days). France clears in the same coupled auction as
+# Germany, so its prices for day d are unknown at forecast time: only yesterday's prices are used.
+FRENCH_BLOCKS = [
+    ("fr_price", "price", 1),
+    ("fr_load", "load_forecast_winsorized", 0),
+    ("fr_renewables", "renewables_total", 0),
+]
+LAGGED_PRICE_PREFIXES = ("price_lag", "fr_price_lag")
 
 
 class DayData(NamedTuple):
@@ -89,6 +98,19 @@ def build_day_table(hourly):
     return pl.concat(blocks, how="horizontal")
 
 
+def french_day_table():
+    """Return one row per date with the 72 French inputs: prices on d-1, load and renewables forecasts for d."""
+    hourly = pl.read_parquet(FRENCH_HOURLY_PATH)
+    blocks = []
+    dates = None
+    for prefix, column, lag_days in FRENCH_BLOCKS:
+        wide = wide_by_hour(hourly, column, prefix)
+        check_contiguous(wide["date"])
+        dates = wide.select("date")
+        blocks.append(lagged_block(wide, prefix, lag_days))
+    return pl.concat([dates, *blocks], how="horizontal")
+
+
 def target_columns():
     """Return the 24 target column names."""
     names = []
@@ -97,12 +119,15 @@ def target_columns():
     return names
 
 
-def load_day_data():
-    """Return all delivery days as aligned arrays, with outlier-day flags attached."""
+def load_day_data(include_france=False):
+    """Return all delivery days as aligned arrays, with outlier-day flags attached (and the French inputs if asked)."""
     hourly = pl.read_parquet(HOURLY_PATH)
     flags = pl.read_parquet(FLAGS_PATH).select("date", "is_outlier")
     table = build_day_table(hourly).join(flags, on="date", how="left")
-    table = table.with_columns(pl.col("is_outlier").fill_null(False))
+    if include_france:
+        # Left join on German dates: days without French data get nulls, so has_features is False there.
+        table = table.join(french_day_table(), on="date", how="left")
+    table = table.sort("date").with_columns(pl.col("is_outlier").fill_null(False))
 
     targets = table.select(target_columns()).to_numpy().astype(float)
     feature_names = table.drop("date", "is_outlier", *target_columns()).columns
@@ -136,8 +161,9 @@ def lag_columns(prefix, lag_days):
 
 
 def price_feature_indices(data):
-    """Return the positions of every lagged-price input (these get the asinh transform)."""
-    names = []
-    for lag_days in PRICE_LAGS_DAYS:
-        names.extend(lag_columns("price", lag_days))
-    return column_indices(data, names)
+    """Return the positions of every lagged-price input, German or French (these get the asinh transform)."""
+    indices = []
+    for position, name in enumerate(data.feature_names):
+        if name.startswith(LAGGED_PRICE_PREFIXES):
+            indices.append(position)
+    return np.array(indices)

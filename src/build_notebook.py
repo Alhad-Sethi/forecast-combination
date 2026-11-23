@@ -232,13 +232,31 @@ import matplotlib.pyplot as plt
 import polars as pl
 
 RESULTS_DIR = Path("..") / "data" / "results"
-# The palette has 8 colour-blind-safe hues, so the four weakest experts share one grey band.
+# The palette has 8 colour-blind-safe hues, so the stacked plots show expert families, not single experts.
 OTHER_BAND = "naive, arx, rf, knn"
-OTHER_EXPERTS = ["naive", "arx", "rf", "knn"]
+GERMAN_LEAR_BAND = "lear (5 German windows)"
+FRENCH_LEAR_BAND = "lear_fr (112, 728)"
+EXPERT_BANDS = {
+    "naive": OTHER_BAND,
+    "arx": OTHER_BAND,
+    "rf": OTHER_BAND,
+    "knn": OTHER_BAND,
+    "lear_56": GERMAN_LEAR_BAND,
+    "lear_84": GERMAN_LEAR_BAND,
+    "lear_112": GERMAN_LEAR_BAND,
+    "lear_364": GERMAN_LEAR_BAND,
+    "lear_728": GERMAN_LEAR_BAND,
+    "lear_fr_112": FRENCH_LEAR_BAND,
+    "lear_fr_728": FRENCH_LEAR_BAND,
+    "lgbm": "lgbm",
+    "lgbm_change": "lgbm_change",
+    "lgbm_fr": "lgbm_fr",
+    "lgbm_change_fr": "lgbm_change_fr",
+}
 # The fixed order sets both the stacking order and each band's colour, identical in every chart.
-EXPERT_ORDER = [OTHER_BAND, "lear_56", "lear_84", "lear_112", "lear_364", "lear_728", "lgbm", "lgbm_change"]
+EXPERT_ORDER = [OTHER_BAND, GERMAN_LEAR_BAND, FRENCH_LEAR_BAND, "lgbm", "lgbm_change", "lgbm_fr", "lgbm_change_fr"]
 # Grey for the folded band, then the categorical palette checked for separation between neighbouring bands.
-EXPERT_COLOURS = ["#9e9d96", "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"]
+EXPERT_COLOURS = ["#9e9d96", "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]
 METHODS = ["ewa", "boa"]
 METHOD_COLOURS = {"ewa": "#2a78d6", "boa": "#eb6834"}
 FOLD_STARTS = [date(2021, 1, 1), date(2022, 1, 1), date(2023, 1, 1)]
@@ -267,7 +285,7 @@ selections.filter(pl.col("method") == "ewa").select("test_year", "eta", "half_li
     ("code", """def weight_matrix(weights, method):
     \"\"\"Return dates and a (days, bands) array of one method's daily weights, columns in EXPERT_ORDER.\"\"\"
     banded = weights.filter(pl.col("method") == method).with_columns(
-        pl.when(pl.col("expert").is_in(OTHER_EXPERTS)).then(pl.lit(OTHER_BAND)).otherwise(pl.col("expert")).alias("band")
+        pl.col("expert").replace_strict(EXPERT_BANDS).alias("band")
     )
     banded = banded.group_by("date", "band").agg(pl.col("weight").sum())
     wide = banded.pivot(on="band", index="date", values="weight")
@@ -297,7 +315,7 @@ def plot_weight_stack(ax, dates, daily_weights, title):
     ax.set_title(title, loc="left")"""),
     ("markdown", """## Daily weights
 
-Bands are stacked bottom to top in the legend's order: naive at the bottom, LightGBM at the top."""),
+Each band is an expert family (summed weights), stacked bottom to top in the legend's order. Weights of single experts are in the table at the end."""),
     ("code", """fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
 for ax, method in zip(axes, METHODS):
     dates, daily_weights = weight_matrix(weights, method)
@@ -305,11 +323,11 @@ for ax, method in zip(axes, METHODS):
 handles, labels = axes[0].get_legend_handles_labels()
 # Reversed so the legend reads top to bottom in the same order as the bands.
 fig.legend(handles[::-1], labels[::-1], loc="center right", frameon=False)
-fig.subplots_adjust(right=0.88)
+fig.subplots_adjust(right=0.82)
 plt.show()"""),
     ("markdown", """## How concentrated are the weights?
 
-Effective number of experts = 1 / sum of squared weights: the number of experts (11) means equal weights (1/N), 1 means all weight on a single expert."""),
+Effective number of experts = 1 / sum of squared weights: the number of experts (15) means equal weights (1/N), 1 means all weight on a single expert."""),
     ("code", """def effective_experts(weights):
     \"\"\"Return one row per (date, method) with the effective number of experts.\"\"\"
     concentration = weights.group_by("date", "method").agg((1 / (pl.col("weight") ** 2).sum()).alias("effective"))

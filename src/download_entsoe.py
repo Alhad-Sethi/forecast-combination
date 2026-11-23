@@ -1,7 +1,8 @@
-"""Download German day-ahead prices, load and wind/solar forecasts from ENTSO-E as yearly parquet files.
+"""Download day-ahead prices, load and wind/solar forecasts from ENTSO-E as yearly parquet files (--market DE or FR).
 Finished years are skipped on rerun; the current year is always re-downloaded."""
 
 import os
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -12,11 +13,23 @@ FIRST_YEAR = 2015
 TIMEZONE = "Europe/Brussels"
 RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw" / "entsoe"
 
-# The German-Austrian bidding zone split on this date; prices before it belong to DE_AT_LU.
-ZONE_SPLIT = pd.Timestamp("2018-10-01", tz=TIMEZONE)
-PRICE_AREA_BEFORE_SPLIT = "DE_AT_LU"
-PRICE_AREA_AFTER_SPLIT = "DE_LU"
-FORECAST_AREA = "DE"
+DEFAULT_MARKET = "DE"
+# Per market: ENTSO-E area codes and the raw folder. Germany's prices came from the German-Austrian zone
+# before the zone split on 2018-10-01; Germany predates the per-market layout, so its files sit in RAW_DIR.
+MARKETS = {
+    "DE": {
+        "raw_dir": RAW_DIR,
+        "price_area_before_split": "DE_AT_LU",
+        "price_area": "DE_LU",
+        "zone_split": pd.Timestamp("2018-10-01", tz=TIMEZONE),
+        "forecast_area": "DE",
+    },
+    "FR": {
+        "raw_dir": RAW_DIR / "FR",
+        "price_area": "FR",
+        "forecast_area": "FR",
+    },
+}
 
 # Day-ahead data for tomorrow is published today, so ask for a little past now.
 DAYS_AHEAD_TO_REQUEST = 2
@@ -51,27 +64,41 @@ def year_bounds(year):
     return start, end
 
 
-def fetch_prices(client, start, end):
-    """Return day-ahead prices for Germany, querying the right bidding zone on each side of the split."""
+def selected_market():
+    """Return the market code given after --market on the command line (Germany by default)."""
+    if "--market" not in sys.argv:
+        return DEFAULT_MARKET
+    market = sys.argv[sys.argv.index("--market") + 1]
+    if market not in MARKETS:
+        raise SystemExit(f"--market {market}: unknown; known markets are {list(MARKETS)}")
+    return market
+
+
+def fetch_prices(client, config, start, end):
+    """Return day-ahead prices, querying the right bidding zone on each side of a zone split if the market had one."""
+    zone_split = config.get("zone_split")
+    if zone_split is None:
+        prices = client.query_day_ahead_prices(config["price_area"], start=start, end=end)
+        return prices.to_frame(name="price_eur_mwh")
     pieces = []
-    if start < ZONE_SPLIT:
-        piece_end = min(end, ZONE_SPLIT)
-        pieces.append(client.query_day_ahead_prices(PRICE_AREA_BEFORE_SPLIT, start=start, end=piece_end))
-    if end > ZONE_SPLIT:
-        piece_start = max(start, ZONE_SPLIT)
-        pieces.append(client.query_day_ahead_prices(PRICE_AREA_AFTER_SPLIT, start=piece_start, end=end))
+    if start < zone_split:
+        piece_end = min(end, zone_split)
+        pieces.append(client.query_day_ahead_prices(config["price_area_before_split"], start=start, end=piece_end))
+    if end > zone_split:
+        piece_start = max(start, zone_split)
+        pieces.append(client.query_day_ahead_prices(config["price_area"], start=piece_start, end=end))
     prices = pd.concat(pieces)
     return prices.to_frame(name="price_eur_mwh")
 
 
-def fetch_load_forecast(client, start, end):
-    """Return the day-ahead total load forecast for Germany."""
-    return client.query_load_forecast(FORECAST_AREA, start=start, end=end)
+def fetch_load_forecast(client, config, start, end):
+    """Return the day-ahead total load forecast."""
+    return client.query_load_forecast(config["forecast_area"], start=start, end=end)
 
 
-def fetch_renewables_forecast(client, start, end):
-    """Return the day-ahead wind and solar generation forecasts for Germany."""
-    return client.query_wind_and_solar_forecast(FORECAST_AREA, start=start, end=end)
+def fetch_renewables_forecast(client, config, start, end):
+    """Return the day-ahead wind and solar generation forecasts."""
+    return client.query_wind_and_solar_forecast(config["forecast_area"], start=start, end=end)
 
 
 SERIES_FETCHERS = {
@@ -81,9 +108,9 @@ SERIES_FETCHERS = {
 }
 
 
-def raw_path(series_name, year):
-    """Return the parquet path for one series and year."""
-    return RAW_DIR / series_name / f"{year}.parquet"
+def raw_path(config, series_name, year):
+    """Return the parquet path for one market, series and year."""
+    return config["raw_dir"] / series_name / f"{year}.parquet"
 
 
 def save_raw(frame, path):
@@ -94,9 +121,9 @@ def save_raw(frame, path):
     temporary_path.replace(path)
 
 
-def download_year(client, series_name, year, current_year):
+def download_year(client, config, series_name, year, current_year):
     """Download one series for one year unless a finished file already exists."""
-    path = raw_path(series_name, year)
+    path = raw_path(config, series_name, year)
     if path.exists() and year < current_year:
         print(f"skip  {series_name} {year} (exists)")
         return
@@ -104,7 +131,7 @@ def download_year(client, series_name, year, current_year):
     start, end = year_bounds(year)
     fetch = SERIES_FETCHERS[series_name]
     try:
-        frame = fetch(client, start, end)
+        frame = fetch(client, config, start, end)
     except NoMatchingDataError:
         print(f"empty {series_name} {year} (no data returned)")
         return
@@ -114,12 +141,15 @@ def download_year(client, series_name, year, current_year):
 
 
 def main():
+    market = selected_market()
+    config = MARKETS[market]
     client = build_client()
     current_year = pd.Timestamp.now(tz=TIMEZONE).year
 
+    print(f"downloading {market}")
     for series_name in SERIES_FETCHERS:
         for year in range(FIRST_YEAR, current_year + 1):
-            download_year(client, series_name, year, current_year)
+            download_year(client, config, series_name, year, current_year)
 
 
 if __name__ == "__main__":
