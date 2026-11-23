@@ -1,6 +1,8 @@
 """Run the development folds: pick each combiner's hyperparameters on the 3 years before a test year,
-then run every method through that year. Writes forecasts, selections, grid scores and weights to data/results/."""
+then run every method through that year. Writes forecasts, selections, grid scores and weights to data/results/
+(or data/results/subset_<name>/ with --experts <name>, where the combiners see only that subset of experts)."""
 
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -19,6 +21,41 @@ ETA_GRID = [0.0, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0]
 HALF_LIFE_GRID_DAYS = [1, 3, 7, 30, 365, np.inf]
 TREE_DEPTH_GRID = [1, 2, 3]
 TREE_MIN_LEAF_GRID_HOURS = [200, 500, 1000, 2000]
+
+# Expert subsets, each fixed by a rule on 2017-2019 only (before the first test fold).
+# A: drop the experts whose removal improved 1/N in all three pre-test years (naive, arx, rf, knn).
+EXPERT_SUBSETS = {
+    "A": [
+        "lear_56",
+        "lear_84",
+        "lear_112",
+        "lear_364",
+        "lear_728",
+        "lear_fr_112",
+        "lear_fr_728",
+        "lgbm",
+        "lgbm_change",
+        "lgbm_fr",
+        "lgbm_change_fr",
+    ],
+}
+
+
+def selected_subset():
+    """Return (subset name, expert names) from --experts on the command line, or (None, None) for all experts."""
+    if "--experts" not in sys.argv:
+        return None, None
+    name = sys.argv[sys.argv.index("--experts") + 1]
+    if name not in EXPERT_SUBSETS:
+        raise SystemExit(f"--experts {name}: unknown; known subsets are {list(EXPERT_SUBSETS)}")
+    return name, EXPERT_SUBSETS[name]
+
+
+def results_dir_for(subset_name):
+    """Return where a run's results go: data/results/ for all experts, data/results/subset_<name>/ otherwise."""
+    if subset_name is None:
+        return RESULTS_DIR
+    return RESULTS_DIR / f"subset_{subset_name}"
 
 
 def day_index(inputs, day):
@@ -154,7 +191,10 @@ def selections_frame(test_year, selections):
 
 
 def main():
-    inputs = load_combiner_inputs()
+    subset_name, expert_names = selected_subset()
+    results_dir = results_dir_for(subset_name)
+    inputs = load_combiner_inputs(expert_names=expert_names)
+    print(f"experts: {inputs.expert_names}", flush=True)
     forecast_frames = []
     weight_frames = []
     grid_frames = []
@@ -167,12 +207,12 @@ def main():
         grid_frames.append(grid_frame(test_year, grid_scores))
         selection_frames.append(selections_frame(test_year, selections))
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    pl.concat(forecast_frames).write_parquet(RESULTS_DIR / "combined_forecasts.parquet")
-    pl.concat(weight_frames).write_parquet(RESULTS_DIR / "weights.parquet")
-    pl.concat(grid_frames, how="diagonal").write_csv(RESULTS_DIR / "grid_scores.csv")
+    results_dir.mkdir(parents=True, exist_ok=True)
+    pl.concat(forecast_frames).write_parquet(results_dir / "combined_forecasts.parquet")
+    pl.concat(weight_frames).write_parquet(results_dir / "weights.parquet")
+    pl.concat(grid_frames, how="diagonal").write_csv(results_dir / "grid_scores.csv")
     selections = pl.concat(selection_frames, how="diagonal")
-    selections.write_csv(RESULTS_DIR / "selections.csv")
+    selections.write_csv(results_dir / "selections.csv")
     with pl.Config(tbl_rows=-1, tbl_cols=-1):
         print(selections)
 

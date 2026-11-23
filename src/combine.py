@@ -58,10 +58,12 @@ def naive_loss_scale(data):
     return trailing.fill_null(np.nan).to_numpy()
 
 
-def expert_forecast_array(first_date, end_date):
+def expert_forecast_array(first_date, end_date, expert_names=None):
     """Return expert names and a (days, experts, 24) array of forecasts for dates in [first_date, end_date)."""
     forecasts = pl.read_parquet(FORECASTS_PATH)
     forecasts = forecasts.filter(pl.col("date").is_between(first_date, end_date, closed="left"))
+    if expert_names is not None:
+        forecasts = forecasts.filter(pl.col("expert").is_in(expert_names))
     forecasts = forecasts.sort("date", "expert", "hour")
     expert_names = forecasts["expert"].unique().sort().to_list()
     num_days = forecasts["date"].n_unique()
@@ -69,8 +71,8 @@ def expert_forecast_array(first_date, end_date):
     return expert_names, values.reshape(num_days, len(expert_names), HOURS_PER_DAY)
 
 
-def load_combiner_inputs(include_holdout=False):
-    """Return combiner inputs from the first expert forecast up to the holdout (or to the end)."""
+def load_combiner_inputs(include_holdout=False, expert_names=None):
+    """Return combiner inputs from the first expert forecast up to the holdout (or to the end), for all or some experts."""
     data = load_day_data()
     scale = naive_loss_scale(data)
     first_date = pl.read_parquet(FORECASTS_PATH)["date"].min()
@@ -78,7 +80,7 @@ def load_combiner_inputs(include_holdout=False):
         end_date = date.max
     else:
         end_date = HOLDOUT_START
-    expert_names, forecasts = expert_forecast_array(first_date, end_date)
+    expert_names, forecasts = expert_forecast_array(first_date, end_date, expert_names)
 
     first_index = data.dates.index(first_date)
     days = np.arange(first_index, first_index + forecasts.shape[0])

@@ -1,5 +1,5 @@
 """Score combined forecasts and experts on the development test years: MAE and the spread of the errors.
-Reads data/results/ from walk_forward.py; the holdout is never loaded."""
+Reads data/results/ (or data/results/subset_<name>/ with --experts <name>) from walk_forward.py; the holdout is never loaded."""
 
 from pathlib import Path
 
@@ -8,10 +8,9 @@ import polars as pl
 
 from combine import load_combiner_inputs
 from data import load_dev_hourly
-from walk_forward import FOLD_TEST_YEARS, fold_bounds, scaled_mae
+from walk_forward import FOLD_TEST_YEARS, fold_bounds, results_dir_for, scaled_mae, selected_subset
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-RESULTS_DIR = PROJECT_DIR / "data" / "results"
 EXPERT_FORECASTS_PATH = PROJECT_DIR / "data" / "experts" / "forecasts.parquet"
 
 BASELINE_METHOD = "equal_weights"
@@ -23,11 +22,14 @@ HEADLINE_METRICS = ["mae", "error_std"]
 PERCENT = 100
 
 
-def load_evaluation_frame():
-    """Return one row per (date, hour, method) with forecast and actual price, for combiners and experts."""
-    combined = pl.read_parquet(RESULTS_DIR / "combined_forecasts.parquet")
+def load_evaluation_frame(results_dir, expert_names):
+    """Return one row per (date, hour, method) with forecast and actual, for combiners and the pool's experts (+ naive)."""
+    combined = pl.read_parquet(results_dir / "combined_forecasts.parquet")
     test_dates = combined.select("date").unique()
     experts = pl.read_parquet(EXPERT_FORECASTS_PATH).join(test_dates, on="date", how="semi")
+    if expert_names is not None:
+        # The seasonal naive stays in for rMAE even when it is not in the pool.
+        experts = experts.filter(pl.col("expert").is_in(expert_names + ["naive"]))
     experts = experts.with_columns((EXPERT_PREFIX + pl.col("expert")).alias("method")).drop("expert")
     actual = load_dev_hourly().select("date", "hour", pl.col("price").alias("actual"))
     frame = pl.concat([combined, experts.select(combined.columns)])
@@ -69,9 +71,20 @@ def win_loss_tally(metrics):
     ).sort("method")
 
 
-def selected_experts():
-    """Return, per test year, the expert with the best combiner selection score over that fold's training years."""
-    inputs = load_combiner_inputs()
+def pool_methods(frame, expert_names):
+    """Return the method names ("expert:<name>") of the experts the combiners used."""
+    if expert_names is None:
+        methods = frame.filter(pl.col("method").str.starts_with(EXPERT_PREFIX))["method"].unique()
+        return sorted(methods.to_list())
+    methods = []
+    for name in expert_names:
+        methods.append(EXPERT_PREFIX + name)
+    return sorted(methods)
+
+
+def selected_experts(expert_names):
+    """Return, per test year, the pool expert with the best combiner selection score over that fold's training years."""
+    inputs = load_combiner_inputs(expert_names=expert_names)
     rows = []
     for test_year in FOLD_TEST_YEARS:
         training_start, test_start, _ = fold_bounds(inputs, test_year)
@@ -87,9 +100,9 @@ def selected_experts():
     return pl.DataFrame(rows)
 
 
-def best_expert_in_hindsight(metrics, column):
-    """Return, per year, the expert with the lowest test-year `column` and its value."""
-    experts = metrics.filter(pl.col("method").str.starts_with(EXPERT_PREFIX)).sort("year", column)
+def best_expert_in_hindsight(metrics, column, pool):
+    """Return, per year, the pool expert with the lowest test-year `column` and its value."""
+    experts = metrics.filter(pl.col("method").is_in(pool)).sort("year", column)
     best = experts.group_by("year", maintain_order=True).first()
     return best.select(
         "year",
@@ -104,12 +117,12 @@ def selected_expert_scores(metrics, column, selected):
     return selected.join(scores, on=["year", "selected_expert"], how="left").select("year", f"selected_{column}")
 
 
-def expert_comparison(metrics, selected):
+def expert_comparison(metrics, selected, pool):
     """Return each combiner's test-year MAE and error std next to the hindsight-best and training-selected experts."""
     combiners = metrics.filter(pl.col("method").is_in([BASELINE_METHOD] + CHALLENGERS))
     compared = combiners.select("year", "method", *HEADLINE_METRICS).join(selected, on="year")
     for column in HEADLINE_METRICS:
-        compared = compared.join(best_expert_in_hindsight(metrics, column), on="year")
+        compared = compared.join(best_expert_in_hindsight(metrics, column, pool), on="year")
         compared = compared.join(selected_expert_scores(metrics, column, selected), on="year")
     return compared.sort("year", "mae")
 
@@ -123,10 +136,9 @@ def expert_tally(comparison):
     return comparison.group_by("method").agg(*counts, pl.len().alias("years")).sort("method")
 
 
-def expert_error_matrix(frame, year):
-    """Return expert names and an (experts, hours) array of forecast errors for one test year."""
-    is_expert = pl.col("method").str.starts_with(EXPERT_PREFIX)
-    experts = frame.filter(is_expert & (pl.col("year") == year))
+def expert_error_matrix(frame, year, pool):
+    """Return the pool's expert names and an (experts, hours) array of their forecast errors for one test year."""
+    experts = frame.filter(pl.col("method").is_in(pool) & (pl.col("year") == year))
     experts = experts.with_columns((pl.col("forecast") - pl.col("actual")).alias("error"))
     wide = experts.pivot(on="method", index=["date", "hour"], values="error").sort("date", "hour")
     names = []
@@ -137,11 +149,11 @@ def expert_error_matrix(frame, year):
     return names, wide.select(names).to_numpy().T
 
 
-def expert_diversity(frame):
-    """Per test year and expert: MAE, mean error correlation with the others, and how much 1/N worsens without it."""
+def expert_diversity(frame, pool):
+    """Per test year and pool expert: MAE, mean error correlation with the others, and how much 1/N worsens without it."""
     rows = []
     for year in sorted(frame["year"].unique().to_list()):
-        names, errors = expert_error_matrix(frame, year)
+        names, errors = expert_error_matrix(frame, year, pool)
         correlations = np.corrcoef(errors)
         # The error of an average forecast is the average of the experts' errors.
         equal_weight_mae = np.abs(errors.mean(axis=0)).mean()
@@ -160,18 +172,21 @@ def expert_diversity(frame):
 
 
 def main():
-    frame = load_evaluation_frame()
+    subset_name, expert_names = selected_subset()
+    results_dir = results_dir_for(subset_name)
+    frame = load_evaluation_frame(results_dir, expert_names)
+    pool = pool_methods(frame, expert_names)
     metrics = error_metrics(frame)
     tally = win_loss_tally(metrics)
-    comparison = expert_comparison(metrics, selected_experts())
+    comparison = expert_comparison(metrics, selected_experts(expert_names), pool)
     comparison_tally = expert_tally(comparison)
-    diversity = expert_diversity(frame)
+    diversity = expert_diversity(frame, pool)
 
-    metrics.write_csv(RESULTS_DIR / "metrics.csv")
-    tally.write_csv(RESULTS_DIR / "tally.csv")
-    comparison.write_csv(RESULTS_DIR / "expert_comparison.csv")
-    comparison_tally.write_csv(RESULTS_DIR / "expert_tally.csv")
-    diversity.write_csv(RESULTS_DIR / "expert_diversity.csv")
+    metrics.write_csv(results_dir / "metrics.csv")
+    tally.write_csv(results_dir / "tally.csv")
+    comparison.write_csv(results_dir / "expert_comparison.csv")
+    comparison_tally.write_csv(results_dir / "expert_tally.csv")
+    diversity.write_csv(results_dir / "expert_diversity.csv")
     with pl.Config(tbl_rows=-1, tbl_cols=-1, float_precision=2):
         print(metrics)
         print(tally)
