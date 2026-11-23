@@ -68,25 +68,29 @@ def test_ewa_skips_outlier_days():
 
 
 def test_boa_hand_worked():
-    # Experts forecast 1 and 3, the price is 0, scale 1, prior (0.5, 0.5).
-    # Day 1: combined 2, gradient sign(2 - 0) = 1, excess losses l = f - combined = (-1, +1).
-    #   S = (-1, 1) (learning rates start at 0), E = (1, 1), V = (1, 1)
-    #   eta = min(1 / 2, sqrt(ln 2 / 1) = 0.8326) = 0.5 for both
-    #   day 2 weight on expert 0 = e^0.5 / (e^0.5 + e^-0.5) = 0.731059
-    # Day 2: combined = 0.731059 * 1 + 0.268941 * 3 = 1.537883, gradient 1, l = (-0.537883, 1.462117)
-    #   S = (-1 - 0.537883 + 0.5 * 0.289318, 1 + 1.462117 + 0.5 * 2.137786) = (-1.393224, 3.531010)
-    #   E = (1, 1.462117), V = (1.289318, 3.137786)
-    #   eta_0 = min(0.5, sqrt(0.693147 / 1.289318) = 0.733220) = 0.5
-    #   eta_1 = min(1 / 2.924234 = 0.341970, sqrt(0.693147 / 3.137786) = 0.470005) = 0.341970
-    #   log weights (prior cancels): ln 0.5 + 0.5 * 1.393224 = 0.003465
-    #                                ln 0.341970 - 0.341970 * 3.531010 = -2.280567
-    #   day 3 weight on expert 0 = 1 / (1 + e^(-2.284032)) = 0.907542
+    # Wintenberger (2017), Figure 2. Experts forecast 1 and 3, the price is 0, scale 1, prior (0.5, 0.5).
+    # Day 1: weights = prior (rates start at 0); combined 2, gradient sign(2 - 0) = 1, l = f - combined = (-1, +1).
+    #   max |l| = (1, 1) -> k = 0 -> E = 2^1 = (2, 2). No range break (previous rates are 0).
+    #   L = 0.5 * l = (-0.5, 0.5), V = (1, 1)
+    #   eta = min(1 / 2, sqrt(ln 2 / 1) = 0.832555) = 0.5 for both
+    #   day 2 weight on expert 0 = 1 / (1 + e^(-0.5 * (0.5 + 0.5))) = 1 / (1 + e^-0.5) = 0.622459
+    # Day 2: combined = 0.622459 + 0.377541 * 3 = 1.755082, gradient 1, l = (-0.755082, 1.244918)
+    #   max |l| = (1, 1.244918) -> E = (2, 4)
+    #   range break: eta * l = (-0.377541, 0.622459) -> only expert 1 (> 0.5), so it pays E = 4
+    #   L0 = -0.5 + 0.5 * (-0.755082 * (1 - 0.377541)) = -0.5 - 0.235004 = -0.735004
+    #   L1 = 0.5 + 0.5 * (1.244918 * 1.622459 + 4) = 0.5 + 0.5 * 6.019829 = 3.509914
+    #   V = (1.570149, 2.549821)
+    #   eta_0 = min(1 / 2, sqrt(0.693147 / 1.570149) = 0.664420) = 0.5
+    #   eta_1 = min(1 / 4, sqrt(0.693147 / 2.549821) = 0.521385) = 0.25
+    #   log weights (prior cancels): ln 0.5 + 0.5 * 0.735004 = -0.325645
+    #                                ln 0.25 - 0.25 * 3.509914 = -2.263773
+    #   day 3 weight on expert 0 = 1 / (1 + e^(-1.938128)) = 0.874146
     inputs = constant_inputs([[1, 3], [1, 3], [1, 3]], [0, 0, 0])
     combined, weights = run_boa(inputs, 0, 3)
     assert_close(weights[0, 0], 0.5, "BOA day 1")
-    assert_close(weights[1, 0], 0.731059, "BOA day 2")
-    assert_close(combined[1, 0], 1.537883, "BOA day 2 combined forecast")
-    assert_close(weights[2, 0], 0.907542, "BOA day 3")
+    assert_close(weights[1, 0], 0.622459, "BOA day 2")
+    assert_close(combined[1, 0], 1.755082, "BOA day 2 combined forecast")
+    assert_close(weights[2, 0], 0.874146, "BOA day 3")
 
 
 def test_boa_learns_a_perfect_expert():

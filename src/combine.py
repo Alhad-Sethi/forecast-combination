@@ -21,6 +21,11 @@ SCALE_WINDOW_DAYS = 28
 # The loss scale needs at least a week of naive errors before it is trusted.
 SCALE_MIN_DAYS = 7
 
+# BOA range estimates are powers of two, 2^(k+1) with k >= -c; the paper's c makes 2^-c negligible.
+BOA_NEGLIGIBLE_RANGE_EXPONENT = 30
+# BOA penalizes an expert when eta * loss exceeds this, i.e. when the loss breaks its estimated range.
+BOA_RANGE_BREAK = 0.5
+
 TREE_HISTORY_DAYS = 3 * 365
 TREE_REFIT_DAYS = 7
 TREE_MIN_TRAINING_DAYS = 28
@@ -150,7 +155,7 @@ def run_ewa(inputs, start, end, eta, half_life_days, per_hour=False):
     return combined, weight_history
 
 
-# ---------- gradient BOA (Wintenberger 2017, adaptive learning rates) ----------
+# ---------- gradient BOA (Wintenberger 2017, fully adaptive version: Figure 2 of the paper) ----------
 
 
 @dataclass
@@ -176,15 +181,27 @@ def linearized_excess_losses(inputs, day, combined):
     return (inputs.forecasts[day] - combined) @ gradients / gradients.size
 
 
+def boa_range_estimates(max_abs_loss):
+    """Return E = 2^(k+1) per expert, with k >= -c the smallest integer such that max |l| <= 2^k."""
+    exponents = np.full(max_abs_loss.shape, -BOA_NEGLIGIBLE_RANGE_EXPONENT, dtype=float)
+    positive = max_abs_loss > 0
+    exponents[positive] = np.maximum(np.ceil(np.log2(max_abs_loss[positive])), -BOA_NEGLIGIBLE_RANGE_EXPONENT)
+    return 2.0 ** (exponents + 1)
+
+
 def boa_update(state, excess_losses, prior):
-    """Return the state after one day: accumulate l + eta*l^2, then reset each expert's learning rate."""
-    cumulative_loss = state.cumulative_loss + excess_losses + state.learning_rates * excess_losses**2
+    """Return the state after one day, following steps 1-3 of the paper's fully adaptive BOA."""
     max_abs_loss = np.maximum(state.max_abs_loss, np.abs(excess_losses))
+    ranges = boa_range_estimates(max_abs_loss)
+    # Step 1 uses the previous learning rate; an expert whose loss breaks its range pays the new range.
+    breaks_range = state.learning_rates * excess_losses > BOA_RANGE_BREAK
+    second_order = excess_losses * (1.0 + state.learning_rates * excess_losses)
+    cumulative_loss = state.cumulative_loss + 0.5 * (second_order + ranges * breaks_range)
     sum_squared_loss = state.sum_squared_loss + excess_losses**2
 
     learning_rates = np.zeros_like(prior)
     has_history = sum_squared_loss > 0
-    rate_from_range = 1.0 / (2.0 * max_abs_loss[has_history])
+    rate_from_range = 1.0 / ranges[has_history]
     rate_from_variance = np.sqrt(np.log(1.0 / prior[has_history]) / sum_squared_loss[has_history])
     learning_rates[has_history] = np.minimum(rate_from_range, rate_from_variance)
     return BoaState(max_abs_loss, sum_squared_loss, cumulative_loss, learning_rates)
