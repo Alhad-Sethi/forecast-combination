@@ -1,4 +1,4 @@
-"""Generate walk-forward forecasts from every expert and cache them in data/experts/.
+"""Generate walk-forward forecasts from every expert and cache them in data/experts/ (`--add rf knn` appends new experts only).
 Each model is fit only on days before the first day it forecasts; outlier days are never training targets."""
 
 import sys
@@ -11,6 +11,7 @@ import lightgbm as lgb
 import numpy as np
 import polars as pl
 from joblib import Parallel, delayed
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import lars_path
 
@@ -61,9 +62,26 @@ LGBM_PARAMS = {
     "verbose": -1,
 }
 # Same-hour copies spare the trees from learning which of 24 columns matches the target hour.
-LGBM_OWN_HOUR_INPUTS = [("price", 1), ("price", 2), ("price", 7), ("load", 0), ("renewables", 0)]
+POOLED_OWN_HOUR_INPUTS = [("price", 1), ("price", 2), ("price", 7), ("load", 0), ("renewables", 0)]
 QUARTER_START_MONTHS = [1, 4, 7, 10]
 JANUARY = [1]
+
+RF_WINDOW_DAYS = 728
+RF_PARAMS = {
+    "n_estimators": 300,
+    "max_features": "sqrt",
+    "min_samples_leaf": 5,
+    "n_jobs": NUM_PARALLEL_JOBS,
+    "random_state": 0,
+}
+
+KNN_WINDOW_DAYS = 728
+KNN_NEIGHBOUR_GRID = [5, 10, 20, 40]
+# A day is described by yesterday's prices and its own load and renewables forecasts.
+KNN_DESCRIPTOR_BLOCKS = [("price", 1), ("load", 0), ("renewables", 0)]
+# Neighbours come from the same day type (Monday, Tuesday-Friday, Saturday, Sunday), so weekly shape matches.
+DAY_TYPE_BY_WEEKDAY = {1: 0, 2: 1, 3: 1, 4: 1, 5: 1, 6: 2, 7: 3}
+KNN_CV_DAYS = LEAR_CV_FOLDS * LEAR_CV_FOLD_DAYS
 
 
 # ---------- shared helpers ----------
@@ -141,6 +159,21 @@ def standardize(train_inputs, other_inputs):
     stds = train_inputs.std(axis=0)
     stds[stds == 0] = 1.0
     return (train_inputs - means) / stds, (other_inputs - means) / stds
+
+
+def yesterday_prices(data, days):
+    """Return the 24 prices of the day before each of `days`: (days, 24)."""
+    return data.features[days][:, column_indices(data, lag_columns("price", 1))]
+
+
+def price_changes(data, days, scale):
+    """Return the asinh-scale change from yesterday's same-hour price to each day's price: (days, 24)."""
+    return to_asinh(data.targets[days], scale) - to_asinh(yesterday_prices(data, days), scale)
+
+
+def add_change_to_yesterday(data, days, predicted_changes, scale):
+    """Turn predicted asinh-scale changes into price forecasts by adding them to yesterday's prices."""
+    return from_asinh(to_asinh(yesterday_prices(data, days), scale) + predicted_changes, scale)
 
 
 # ---------- seasonal naive ----------
@@ -318,12 +351,12 @@ def all_lear_forecasts(data, first_index, end_index):
 # ---------- LightGBM ----------
 
 
-def lgbm_rows(data, days):
+def pooled_rows(data, days):
     """Stack one row per (day, hour): the day's 247 inputs, hour of day, and that hour's own inputs."""
     day_inputs = np.repeat(data.features[days], HOURS_PER_DAY, axis=0)
     hours = np.tile(np.arange(HOURS_PER_DAY), len(days))
     own_hour_blocks = []
-    for prefix, lag_days in LGBM_OWN_HOUR_INPUTS:
+    for prefix, lag_days in POOLED_OWN_HOUR_INPUTS:
         block = data.features[days][:, column_indices(data, lag_columns(prefix, lag_days))]
         own_hour_blocks.append(block.reshape(-1))
     return np.column_stack([day_inputs, hours, *own_hour_blocks])
@@ -340,10 +373,106 @@ def lgbm_forecasts(data, first_index, end_index):
             continue
         scale = fit_price_scale(data.targets[train])
         model = lgb.LGBMRegressor(**LGBM_PARAMS)
-        model.fit(lgbm_rows(data, train), to_asinh(data.targets[train].reshape(-1), scale))
-        predicted = from_asinh(model.predict(lgbm_rows(data, predict)), scale)
+        model.fit(pooled_rows(data, train), to_asinh(data.targets[train].reshape(-1), scale))
+        predicted = from_asinh(model.predict(pooled_rows(data, predict)), scale)
         forecasts[predict] = predicted.reshape(len(predict), HOURS_PER_DAY)
     return forecasts
+
+
+# ---------- random forest ----------
+
+
+def rf_forecasts(data, first_index, end_index):
+    """Refit one pooled random forest each quarter on the previous 728 days, predicting the change from yesterday."""
+    forecasts = np.full(data.targets.shape, np.nan)
+    refit_points = calendar_points(data, first_index, end_index, QUARTER_START_MONTHS)
+    for start, end in schedule_blocks(refit_points, end_index):
+        train = training_days(data, start, RF_WINDOW_DAYS)
+        predict = forecast_days(data, start, end)
+        if len(train) < MIN_TRAINING_DAYS or len(predict) == 0:
+            continue
+        scale = fit_price_scale(data.targets[train])
+        # Trees cannot extrapolate; predicting the change from yesterday lets the level follow the market.
+        model = RandomForestRegressor(**RF_PARAMS)
+        model.fit(pooled_rows(data, train), price_changes(data, train, scale).reshape(-1))
+        predicted_changes = model.predict(pooled_rows(data, predict)).reshape(len(predict), HOURS_PER_DAY)
+        forecasts[predict] = add_change_to_yesterday(data, predict, predicted_changes, scale)
+    return forecasts
+
+
+# ---------- similar days (k nearest neighbours) ----------
+
+
+def day_types(data, days):
+    """Return the day type (Monday, Tuesday-Friday, Saturday, Sunday) of each of `days`."""
+    types = []
+    for weekday in data.weekdays[days]:
+        types.append(DAY_TYPE_BY_WEEKDAY[weekday])
+    return np.array(types)
+
+
+def knn_descriptors(data, days, scale):
+    """Return each day's descriptor: yesterday's asinh prices and the day's load and renewables forecasts."""
+    blocks = []
+    for prefix, lag_days in KNN_DESCRIPTOR_BLOCKS:
+        block = data.features[days][:, column_indices(data, lag_columns(prefix, lag_days))]
+        if prefix == "price":
+            block = to_asinh(block, scale)
+        blocks.append(block)
+    return np.column_stack(blocks)
+
+
+def nearest_day_changes(data, day, window_days):
+    """Return the price scale and the price changes of same-type training days, nearest to `day` first."""
+    train = training_days(data, day, window_days)
+    same_type = train[day_types(data, train) == DAY_TYPE_BY_WEEKDAY[data.weekdays[day]]]
+    scale = fit_price_scale(data.targets[train])
+    train_descriptors, day_descriptor = standardize(
+        knn_descriptors(data, same_type, scale),
+        knn_descriptors(data, np.array([day]), scale),
+    )
+    distances = np.linalg.norm(train_descriptors - day_descriptor, axis=1)
+    nearest_first = same_type[np.argsort(distances)]
+    return scale, price_changes(data, nearest_first, scale)
+
+
+def knn_day_forecast(data, day, neighbour_changes, num_neighbours, scale):
+    """Return one day's 24 forecasts: yesterday's prices plus the mean change of the nearest days."""
+    mean_change = neighbour_changes[:num_neighbours].mean(axis=0)
+    return add_change_to_yesterday(data, np.array([day]), mean_change[np.newaxis, :], scale)[0]
+
+
+def tune_knn_neighbours(data, retune_index):
+    """Pick the number of neighbours with the lowest MAE over the 84 usable days before `retune_index`."""
+    validation = training_days(data, retune_index, KNN_CV_DAYS)
+    errors = np.zeros(len(KNN_NEIGHBOUR_GRID))
+    for day in validation:
+        scale, neighbour_changes = nearest_day_changes(data, day, KNN_WINDOW_DAYS)
+        for position, num_neighbours in enumerate(KNN_NEIGHBOUR_GRID):
+            forecast = knn_day_forecast(data, day, neighbour_changes, num_neighbours, scale)
+            errors[position] += np.abs(forecast - data.targets[day]).mean()
+    return KNN_NEIGHBOUR_GRID[int(np.argmin(errors))]
+
+
+def knn_forecasts(data, first_index, end_index):
+    """Forecast each day from its most similar past days; the number of neighbours is retuned yearly."""
+    forecasts = np.full(data.targets.shape, np.nan)
+    retune_points = calendar_points(data, first_index, end_index, JANUARY)
+    num_neighbours = None
+    for day in range(first_index, end_index):
+        if day in retune_points:
+            num_neighbours = tune_knn_neighbours(data, day)
+            print(f"knn: {data.dates[day].year} uses {num_neighbours} neighbours", flush=True)
+        if not data.has_features[day]:
+            continue
+        scale, neighbour_changes = nearest_day_changes(data, day, KNN_WINDOW_DAYS)
+        forecasts[day] = knn_day_forecast(data, day, neighbour_changes, num_neighbours, scale)
+    return forecasts
+
+
+
+# Experts that `--add` can compute on their own and append to the cache.
+ADDABLE_EXPERTS = {"rf": rf_forecasts, "knn": knn_forecasts}
 
 
 # ---------- output ----------
@@ -401,21 +530,67 @@ def timed(label, function, *arguments):
     return result
 
 
-def main():
-    refuse_overwrite()
-    data = load_day_data()
-    first_index, end_index = forecast_index_range(data)
+def requested_additions():
+    """Return the expert names listed after --add on the command line (empty without --add)."""
+    if "--add" not in sys.argv:
+        return []
+    return sys.argv[sys.argv.index("--add") + 1:]
 
+
+def check_additions(names, existing_experts):
+    """Stop unless every name is an addable expert that is not cached yet."""
+    for name in names:
+        if name not in ADDABLE_EXPERTS:
+            raise SystemExit(f"--add {name}: unknown; addable experts are {list(ADDABLE_EXPERTS)}")
+        if name in existing_experts:
+            raise SystemExit(f"--add {name}: already cached; use a full run with --overwrite to recompute it")
+
+
+def write_forecasts(frame):
+    """Write the long forecast table via a temporary file, so a failed write never leaves a broken cache."""
+    temporary_path = FORECASTS_PATH.with_suffix(".tmp.parquet")
+    frame.write_parquet(temporary_path)
+    temporary_path.replace(FORECASTS_PATH)
+
+
+def add_experts(data, names):
+    """Compute only `names` and append them to the cached forecasts; existing experts are never touched."""
+    existing = pl.read_parquet(FORECASTS_PATH)
+    check_additions(names, set(existing["expert"].unique()))
+    first_index, end_index = forecast_index_range(data)
+    forecasts = {}
+    for name in names:
+        forecasts[name] = timed(name, ADDABLE_EXPERTS[name], data, first_index, end_index)
+    write_forecasts(pl.concat([existing, to_long(data, forecasts)]))
+    return forecasts
+
+
+def compute_all_experts(data):
+    """Compute every expert from scratch and write the forecasts and LEAR penalties."""
+    refuse_overwrite()
+    first_index, end_index = forecast_index_range(data)
     forecasts = {}
     forecasts["naive"] = timed("naive", naive_forecasts, data, first_index, end_index)
     forecasts["arx"] = timed("arx", arx_forecasts, data, first_index, end_index)
     lear, penalty_log = timed("lear (5 windows)", all_lear_forecasts, data, first_index, end_index)
     forecasts.update(lear)
     forecasts["lgbm"] = timed("lgbm", lgbm_forecasts, data, first_index, end_index)
+    for name, function in ADDABLE_EXPERTS.items():
+        forecasts[name] = timed(name, function, data, first_index, end_index)
 
     EXPERTS_DIR.mkdir(parents=True, exist_ok=True)
-    to_long(data, forecasts).write_parquet(FORECASTS_PATH)
+    write_forecasts(to_long(data, forecasts))
     penalties_to_frame(penalty_log).write_parquet(LEAR_PENALTIES_PATH)
+    return forecasts
+
+
+def main():
+    data = load_day_data()
+    additions = requested_additions()
+    if additions:
+        forecasts = add_experts(data, additions)
+    else:
+        forecasts = compute_all_experts(data)
     with pl.Config(tbl_cols=-1):
         print(development_mae_table(data, forecasts))
 
