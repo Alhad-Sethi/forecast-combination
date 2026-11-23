@@ -379,6 +379,24 @@ def lgbm_forecasts(data, first_index, end_index):
     return forecasts
 
 
+def lgbm_change_forecasts(data, first_index, end_index):
+    """Same model and schedule as lgbm, but predicting the change from yesterday's same-hour price."""
+    forecasts = np.full(data.targets.shape, np.nan)
+    refit_points = calendar_points(data, first_index, end_index, QUARTER_START_MONTHS)
+    for start, end in schedule_blocks(refit_points, end_index):
+        train = training_days(data, start, LGBM_WINDOW_DAYS)
+        predict = forecast_days(data, start, end)
+        if len(train) < MIN_TRAINING_DAYS or len(predict) == 0:
+            continue
+        scale = fit_price_scale(data.targets[train])
+        # lgbm breaks when prices rise fast because trees cannot extrapolate the level; changes stay in range.
+        model = lgb.LGBMRegressor(**LGBM_PARAMS)
+        model.fit(pooled_rows(data, train), price_changes(data, train, scale).reshape(-1))
+        predicted_changes = model.predict(pooled_rows(data, predict)).reshape(len(predict), HOURS_PER_DAY)
+        forecasts[predict] = add_change_to_yesterday(data, predict, predicted_changes, scale)
+    return forecasts
+
+
 # ---------- random forest ----------
 
 
@@ -472,7 +490,7 @@ def knn_forecasts(data, first_index, end_index):
 
 
 # Experts that `--add` can compute on their own and append to the cache.
-ADDABLE_EXPERTS = {"rf": rf_forecasts, "knn": knn_forecasts}
+ADDABLE_EXPERTS = {"rf": rf_forecasts, "knn": knn_forecasts, "lgbm_change": lgbm_change_forecasts}
 
 
 # ---------- output ----------

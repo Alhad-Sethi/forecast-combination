@@ -232,21 +232,28 @@ import matplotlib.pyplot as plt
 import polars as pl
 
 RESULTS_DIR = Path("..") / "data" / "results"
-# The palette has 8 colour-blind-safe hues, so the two weakest experts share one grey band.
-OTHER_BAND = "naive + arx"
-OTHER_EXPERTS = ["naive", "arx"]
+# The palette has 8 colour-blind-safe hues, so the four weakest experts share one grey band.
+OTHER_BAND = "naive, arx, rf, knn"
+OTHER_EXPERTS = ["naive", "arx", "rf", "knn"]
 # The fixed order sets both the stacking order and each band's colour, identical in every chart.
-EXPERT_ORDER = [OTHER_BAND, "lear_56", "lear_84", "lear_112", "lear_364", "lear_728", "lgbm", "rf", "knn"]
+EXPERT_ORDER = [OTHER_BAND, "lear_56", "lear_84", "lear_112", "lear_364", "lear_728", "lgbm", "lgbm_change"]
 # Grey for the folded band, then the categorical palette checked for separation between neighbouring bands.
-EXPERT_COLOURS = ["#9e9d96", "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+EXPERT_COLOURS = ["#9e9d96", "#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6"]
 METHODS = ["ewa", "boa"]
 METHOD_COLOURS = {"ewa": "#2a78d6", "boa": "#eb6834"}
 FOLD_STARTS = [date(2021, 1, 1), date(2022, 1, 1), date(2023, 1, 1)]
 TRAINING_YEARS = 3
-HALF_LIVES = [7.0, 30.0, 365.0, float("inf")]
-HALF_LIFE_LABELS = {7.0: "7 days", 30.0: "30 days", 365.0: "365 days", float("inf"): "no forgetting"}
+HALF_LIVES = [1.0, 3.0, 7.0, 30.0, 365.0, float("inf")]
+HALF_LIFE_LABELS = {
+    1.0: "1 day",
+    3.0: "3 days",
+    7.0: "7 days",
+    30.0: "30 days",
+    365.0: "365 days",
+    float("inf"): "no forgetting",
+}
 # One blue ramp, light to dark, because half-life is ordered (short to long memory).
-HALF_LIFE_COLOURS = ["#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]
+HALF_LIFE_COLOURS = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281", "#0d366b"]
 
 plt.rcParams["figure.figsize"] = (14, 4)
 plt.rcParams["axes.spines.top"] = False
@@ -302,7 +309,7 @@ fig.subplots_adjust(right=0.88)
 plt.show()"""),
     ("markdown", """## How concentrated are the weights?
 
-Effective number of experts = 1 / sum of squared weights: the number of experts (10) means equal weights (1/N), 1 means all weight on a single expert."""),
+Effective number of experts = 1 / sum of squared weights: the number of experts (11) means equal weights (1/N), 1 means all weight on a single expert."""),
     ("code", """def effective_experts(weights):
     \"\"\"Return one row per (date, method) with the effective number of experts.\"\"\"
     concentration = weights.group_by("date", "method").agg((1 / (pl.col("weight") ** 2).sum()).alias("effective"))
