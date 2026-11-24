@@ -37,7 +37,9 @@ Three challengers, none of them the favourite, against 1/N:
   (detected from the inputs only) are excluded from training but kept in evaluation.
 - **Walk-forward:** each combiner is tuned on 3 years and tested on the next one (2020, 2021, 2022, 2023). Losses are
   scaled by the recent error of a seasonal naive forecast so that crisis days don't dominate.
-- **Holdout:** 2024 onward is reserved for a single final run once the configuration is frozen. It has not been run.
+- **Holdout:** 2024 onward was reserved for a single final run. The configuration was frozen first (git tag
+  `config-frozen`), then the holdout was run once, with the same yearly procedure: 2024 (settings chosen on
+  2021-2023), 2025 (2022-2024) and 2026 up to 24 November (2023-2025).
 - **Measures:** MAE and the standard deviation of hourly errors (EUR/MWh), plus bias.
 
 ## The experts
@@ -57,10 +59,43 @@ Three challengers, none of them the favourite, against 1/N:
 
 Prices are variance-stabilized with an asinh transform (Uniejewski, Weron & Ziel 2018) before fitting.
 
+## Out-of-sample results (holdout, 2024-2026)
+
+Run once on the frozen configuration; nothing was changed afterwards. 2026 covers 1 January to 24 November.
+
+**MAE (EUR/MWh), lower is better:**
+
+| Method | 2024 | 2025 | 2026 | Beats 1/N |
+|---|---|---|---|---|
+| 1/N | 17.82 | 17.20 | 25.91 | |
+| EWA | 17.55 | 16.74 | 24.73 | 3 of 3 |
+| EWA per hour | **17.40** | **16.60** | **24.13** | 3 of 3 |
+| EWA reset | 17.57 | 16.77 | 24.75 | 3 of 3 |
+| BOA | 17.65 | 16.73 | 24.73 | 3 of 3 |
+| Tree | 17.65 | 16.77 | 25.07 | 3 of 3 |
+| Best single expert (hindsight) | 18.17 | 17.26 | 26.26 | |
+
+**Error standard deviation (EUR/MWh):**
+
+| Method | 2024 | 2025 | 2026 | Beats 1/N |
+|---|---|---|---|---|
+| 1/N | **32.08** | 27.50 | 39.49 | |
+| EWA | 32.79 | 27.07 | 38.42 | 2 of 3 |
+| EWA per hour | 32.29 | 26.89 | **38.06** | 2 of 3 |
+| EWA reset | 32.80 | 27.12 | 38.45 | 2 of 3 |
+| BOA | 32.56 | **26.82** | **38.06** | 2 of 3 |
+| Tree | 32.37 | 26.85 | 38.43 | 2 of 3 |
+
+- **Every challenger beats 1/N on MAE in every holdout year**, but by small margins: 1-2.4% (2024), 2.5-3.5%
+  (2025), 3-7% (2026). EWA with separate weights per hour is the best method in all three years.
+- **On error spread, 1/N wins 2024**; the challengers win 2025 and 2026.
+- The holdout years resemble the calm development years: no expert breaks down the way the tree-based experts did in
+  the 2021-22 crisis, so learned weights have little to avoid, and the gain is the small, steady calm-year edge.
+
 ## Development results (2020-2023)
 
 Walk-forward test years. Each year is out of sample for the combiners, but these years were used while designing
-the pipeline, so they are development results, not the final holdout.
+the pipeline, so they are development results; the holdout above is the clean test.
 
 **MAE (EUR/MWh), lower is better:**
 
@@ -83,18 +118,19 @@ the pipeline, so they are development results, not the final holdout.
 | BOA | **9.64** | 27.66 | **55.28** | **25.65** | 4 of 4 |
 | Tree | 9.72 | 27.71 | 56.13 | 25.78 | 4 of 4 |
 
-### What we see so far
+## What we see (all seven test years)
 
-- **EWA and BOA beat 1/N in every test year**, on both MAE and error spread, and they also beat the best single
-  expert chosen in hindsight. 1/N beats that expert in only 1 of 4 years.
+- **Across all seven test years (development + holdout), EWA and BOA beat 1/N on MAE in 7 of 7 and on error
+  spread in 6 of 7**, and they beat the best single expert chosen in hindsight on MAE in every year.
 - **Most of the gain comes from the crisis years** (about 15-18% lower MAE in 2021, 7-8% in 2022). Some experts that
   were good in calm years (the LightGBM models and the random forest) break when prices rise fast; learned weights
   drop them within days, while 1/N keeps giving them 1/15 each.
-- **In calm years the gain is small** (2-4%): close to the classic puzzle, where 1/N is hard to beat.
+- **Outside the crisis the gain is small** (1-7%, including the holdout): close to the classic puzzle, where 1/N
+  is hard to beat.
 - **Information matters more than the combiner.** Removing the day-d wind/solar forecast (to avoid look-ahead) made
   the experts 30-45% worse; adding French inputs gave the largest improvement of any change.
-- Caveats: one market and four test years, and no formal significance tests yet. More markets and the frozen 2024+
-  holdout are the next steps.
+- Caveats: one market, seven test years (the last one partial), and no formal significance tests. Repeating the
+  study on other European markets is the next step.
 
 ## Repository layout
 
@@ -127,6 +163,8 @@ export ENTSOE_API_KEY=...                         # free token from the ENTSO-E 
 .venv/bin/python src/walk_forward.py              # ~4 min
 .venv/bin/python src/evaluate.py
 .venv/bin/python tests/test_combine.py
+.venv/bin/python src/walk_forward.py --holdout    # the single holdout run (~5 min)
+.venv/bin/python src/evaluate.py --holdout
 ```
 
 Data files are not in the repository (`data/` is gitignored); the scripts download and rebuild them.
