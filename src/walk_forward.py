@@ -1,6 +1,7 @@
 """Run the development folds: pick each combiner's hyperparameters on the 3 years before a test year,
 then run every method through that year. Writes forecasts, selections, grid scores and weights to data/results/
-(or data/results/subset_<name>/ with --experts <name>, where the combiners see only that subset of experts)."""
+(or data/results/subset_<name>/ with --experts <name>, where the combiners see only that subset of experts).
+With --holdout it runs the same procedure once on the holdout years (frozen config only) into data/results/holdout/."""
 
 import sys
 from datetime import date
@@ -16,6 +17,8 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 RESULTS_DIR = PROJECT_DIR / "data" / "results"
 
 FOLD_TEST_YEARS = [2020, 2021, 2022, 2023]
+# The last holdout fold ends on the latest day with expert forecasts, not on 31 December.
+HOLDOUT_TEST_YEARS = [2024, 2025, 2026]
 TRAINING_YEARS = 3
 ETA_GRID = [0.0, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0]
 HALF_LIFE_GRID_DAYS = [1, 3, 7, 30, 365, np.inf]
@@ -41,18 +44,34 @@ EXPERT_SUBSETS = {
 }
 
 
+def holdout_requested():
+    """Return True if --holdout is on the command line (the single run of the frozen config)."""
+    return "--holdout" in sys.argv
+
+
+def test_years_for(holdout):
+    """Return the test years of the development folds or of the holdout folds."""
+    if holdout:
+        return HOLDOUT_TEST_YEARS
+    return FOLD_TEST_YEARS
+
+
 def selected_subset():
     """Return (subset name, expert names) from --experts on the command line, or (None, None) for all experts."""
     if "--experts" not in sys.argv:
         return None, None
+    if holdout_requested():
+        raise SystemExit("--holdout runs the frozen config on all experts only; drop --experts")
     name = sys.argv[sys.argv.index("--experts") + 1]
     if name not in EXPERT_SUBSETS:
         raise SystemExit(f"--experts {name}: unknown; known subsets are {list(EXPERT_SUBSETS)}")
     return name, EXPERT_SUBSETS[name]
 
 
-def results_dir_for(subset_name):
-    """Return where a run's results go: data/results/ for all experts, data/results/subset_<name>/ otherwise."""
+def results_dir_for(subset_name, holdout=False):
+    """Return where a run's results go: data/results/ (or holdout/) for all experts, data/results/subset_<name>/ otherwise."""
+    if holdout:
+        return RESULTS_DIR / "holdout"
     if subset_name is None:
         return RESULTS_DIR
     return RESULTS_DIR / f"subset_{subset_name}"
@@ -64,10 +83,12 @@ def day_index(inputs, day):
 
 
 def fold_bounds(inputs, test_year):
-    """Return (training start, test start, test end) day indices for one fold."""
+    """Return (training start, test start, test end) day indices for one fold; the test ends with the year or the data."""
     training_start = day_index(inputs, date(test_year - TRAINING_YEARS, 1, 1))
     test_start = day_index(inputs, date(test_year, 1, 1))
-    test_end = day_index(inputs, date(test_year, 12, 31)) + 1
+    test_end = test_start
+    while test_end < len(inputs.dates) and inputs.dates[test_end].year == test_year:
+        test_end += 1
     return training_start, test_start, test_end
 
 
@@ -191,15 +212,17 @@ def selections_frame(test_year, selections):
 
 
 def main():
+    holdout = holdout_requested()
     subset_name, expert_names = selected_subset()
-    results_dir = results_dir_for(subset_name)
-    inputs = load_combiner_inputs(expert_names=expert_names)
+    results_dir = results_dir_for(subset_name, holdout)
+    inputs = load_combiner_inputs(include_holdout=holdout, expert_names=expert_names)
     print(f"experts: {inputs.expert_names}", flush=True)
+    print(f"days: {inputs.dates[0]} to {inputs.dates[-1]}", flush=True)
     forecast_frames = []
     weight_frames = []
     grid_frames = []
     selection_frames = []
-    for test_year in FOLD_TEST_YEARS:
+    for test_year in test_years_for(holdout):
         print(f"fold {test_year}", flush=True)
         forecasts, selections, grid_scores, weights = run_fold(inputs, test_year)
         forecast_frames.append(forecasts_frame(inputs, test_year, forecasts))

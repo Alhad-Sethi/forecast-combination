@@ -16,6 +16,11 @@ def load_dev_hourly():
     return hourly.filter(pl.col("date") < HOLDOUT_START)
 
 
+def load_all_hourly():
+    """Return the clean hourly table including the holdout (only for the single run of the frozen config)."""
+    return pl.read_parquet(CLEAN_DIR / "de_hourly.parquet")
+
+
 def load_dev_day_flags():
     """Return the outlier-day flags for dates before the holdout."""
     flags = pl.read_parquet(CLEAN_DIR / "day_flags.parquet")

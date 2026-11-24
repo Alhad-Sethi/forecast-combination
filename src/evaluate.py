@@ -1,5 +1,6 @@
 """Score combined forecasts and experts on the development test years: MAE and the spread of the errors.
-Reads data/results/ (or data/results/subset_<name>/ with --experts <name>) from walk_forward.py; the holdout is never loaded."""
+Reads data/results/ (or data/results/subset_<name>/ with --experts <name>) from walk_forward.py; the holdout is loaded
+only with --holdout (the single run of the frozen config, results in data/results/holdout/)."""
 
 from pathlib import Path
 
@@ -7,8 +8,8 @@ import numpy as np
 import polars as pl
 
 from combine import load_combiner_inputs
-from data import load_dev_hourly
-from walk_forward import FOLD_TEST_YEARS, fold_bounds, results_dir_for, scaled_mae, selected_subset
+from data import load_all_hourly, load_dev_hourly
+from walk_forward import fold_bounds, holdout_requested, results_dir_for, scaled_mae, selected_subset, test_years_for
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 EXPERT_FORECASTS_PATH = PROJECT_DIR / "data" / "experts" / "forecasts.parquet"
@@ -22,7 +23,16 @@ HEADLINE_METRICS = ["mae", "error_std"]
 PERCENT = 100
 
 
-def load_evaluation_frame(results_dir, expert_names):
+def load_actual_prices(holdout):
+    """Return the hourly prices: development years only, or including the holdout."""
+    if holdout:
+        hourly = load_all_hourly()
+    else:
+        hourly = load_dev_hourly()
+    return hourly.filter(pl.col("price").is_not_null()).select("date", "hour", pl.col("price").alias("actual"))
+
+
+def load_evaluation_frame(results_dir, expert_names, holdout):
     """Return one row per (date, hour, method) with forecast and actual, for combiners and the pool's experts (+ naive)."""
     combined = pl.read_parquet(results_dir / "combined_forecasts.parquet")
     test_dates = combined.select("date").unique()
@@ -31,7 +41,7 @@ def load_evaluation_frame(results_dir, expert_names):
         # The seasonal naive stays in for rMAE even when it is not in the pool.
         experts = experts.filter(pl.col("expert").is_in(expert_names + ["naive"]))
     experts = experts.with_columns((EXPERT_PREFIX + pl.col("expert")).alias("method")).drop("expert")
-    actual = load_dev_hourly().select("date", "hour", pl.col("price").alias("actual"))
+    actual = load_actual_prices(holdout)
     frame = pl.concat([combined, experts.select(combined.columns)])
     frame = frame.join(actual, on=["date", "hour"], how="inner")
     return frame.with_columns(pl.col("date").dt.year().alias("year"))
@@ -82,11 +92,11 @@ def pool_methods(frame, expert_names):
     return sorted(methods)
 
 
-def selected_experts(expert_names):
+def selected_experts(expert_names, holdout):
     """Return, per test year, the pool expert with the best combiner selection score over that fold's training years."""
-    inputs = load_combiner_inputs(expert_names=expert_names)
+    inputs = load_combiner_inputs(include_holdout=holdout, expert_names=expert_names)
     rows = []
-    for test_year in FOLD_TEST_YEARS:
+    for test_year in test_years_for(holdout):
         training_start, test_start, _ = fold_bounds(inputs, test_year)
         best_name = None
         best_score = np.inf
@@ -172,13 +182,14 @@ def expert_diversity(frame, pool):
 
 
 def main():
+    holdout = holdout_requested()
     subset_name, expert_names = selected_subset()
-    results_dir = results_dir_for(subset_name)
-    frame = load_evaluation_frame(results_dir, expert_names)
+    results_dir = results_dir_for(subset_name, holdout)
+    frame = load_evaluation_frame(results_dir, expert_names, holdout)
     pool = pool_methods(frame, expert_names)
     metrics = error_metrics(frame)
     tally = win_loss_tally(metrics)
-    comparison = expert_comparison(metrics, selected_experts(expert_names), pool)
+    comparison = expert_comparison(metrics, selected_experts(expert_names, holdout), pool)
     comparison_tally = expert_tally(comparison)
     diversity = expert_diversity(frame, pool)
 
