@@ -62,8 +62,8 @@ LGBM_PARAMS = {
     "verbose": -1,
 }
 # Same-hour copies spare the trees from learning which of 24 columns matches the target hour.
-POOLED_OWN_HOUR_INPUTS = [("price", 1), ("price", 2), ("price", 7), ("load", 0), ("renewables", 0)]
-FRENCH_OWN_HOUR_INPUTS = [("fr_price", 1), ("fr_load", 0), ("fr_renewables", 0)]
+POOLED_OWN_HOUR_INPUTS = [("price", 1), ("price", 2), ("price", 7), ("load", 0), ("renewables", 1)]
+FRENCH_OWN_HOUR_INPUTS = [("fr_price", 1), ("fr_load", 0)]
 FRENCH_LEAR_SHORT_WINDOW_DAYS = 112
 FRENCH_LEAR_LONG_WINDOW_DAYS = 728
 QUARTER_START_MONTHS = [1, 4, 7, 10]
@@ -80,8 +80,9 @@ RF_PARAMS = {
 
 KNN_WINDOW_DAYS = 728
 KNN_NEIGHBOUR_GRID = [5, 10, 20, 40]
-# A day is described by yesterday's prices and its own load and renewables forecasts.
-KNN_DESCRIPTOR_BLOCKS = [("price", 1), ("load", 0), ("renewables", 0)]
+# A day is described by yesterday's prices, its own load forecast and yesterday's renewables forecast
+# (the day's own renewables forecast is published after the auction).
+KNN_DESCRIPTOR_BLOCKS = [("price", 1), ("load", 0), ("renewables", 1)]
 # Neighbours come from the same day type (Monday, Tuesday-Friday, Saturday, Sunday), so weekly shape matches.
 DAY_TYPE_BY_WEEKDAY = {1: 0, 2: 1, 3: 1, 4: 1, 5: 1, 6: 2, 7: 3}
 KNN_CV_DAYS = LEAR_CV_FOLDS * LEAR_CV_FOLD_DAYS
@@ -242,7 +243,7 @@ def arx_forecasts(data, first_index, end_index):
 
 
 def lear_inputs(data, days, scale, price_indices):
-    """Return all 247 inputs with the lagged prices asinh-transformed."""
+    """Return all 223 inputs with the lagged prices asinh-transformed."""
     inputs = data.features[days].copy()
     inputs[:, price_indices] = to_asinh(inputs[:, price_indices], scale)
     return inputs
@@ -440,7 +441,7 @@ def day_types(data, days):
 
 
 def knn_descriptors(data, days, scale):
-    """Return each day's descriptor: yesterday's asinh prices and the day's load and renewables forecasts."""
+    """Return each day's descriptor: yesterday's asinh prices, the day's load and yesterday's renewables forecasts."""
     blocks = []
     for prefix, lag_days in KNN_DESCRIPTOR_BLOCKS:
         block = data.features[days][:, column_indices(data, lag_columns(prefix, lag_days))]
@@ -503,13 +504,13 @@ def knn_forecasts(data, first_index, end_index):
 
 
 def lear_fr_short_forecasts(data, first_index, end_index):
-    """LEAR with a 112-day window; with French data it also sees the 72 French inputs."""
+    """LEAR with a 112-day window; with French data it also sees the 48 French inputs."""
     forecasts, _ = lear_forecasts(data, FRENCH_LEAR_SHORT_WINDOW_DAYS, first_index, end_index)
     return forecasts
 
 
 def lear_fr_long_forecasts(data, first_index, end_index):
-    """LEAR with a 728-day window; with French data it also sees the 72 French inputs."""
+    """LEAR with a 728-day window; with French data it also sees the 48 French inputs."""
     forecasts, _ = lear_forecasts(data, FRENCH_LEAR_LONG_WINDOW_DAYS, first_index, end_index)
     return forecasts
 

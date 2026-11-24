@@ -17,15 +17,19 @@ FRENCH_HOURLY_PATH = CLEAN_DIR / "fr_hourly.parquet"
 HOURS_PER_DAY = 24
 DAYS_PER_WEEK = 7
 PRICE_LAGS_DAYS = [1, 2, 3, 7]
-# Lag 0 is the delivery day itself: its load and renewables forecasts are published on d-1.
-FUNDAMENTAL_LAGS_DAYS = [0, 1, 7]
-FUNDAMENTAL_COLUMNS = {"load": "load_forecast_winsorized", "renewables": "renewables_total"}
+# (prefix, clean column, lags in days). Lag 0 is the delivery day itself. Its load forecast is due two hours
+# before the auction closes (Regulation 543/2013, Art. 6), but its wind and solar forecast only by 18:00 on d-1,
+# after the auction (Art. 14), so renewables start at lag 1: the forecast for d-1, published by 18:00 on d-2.
+FUNDAMENTAL_BLOCKS = [
+    ("load", "load_forecast_winsorized", [0, 1, 7]),
+    ("renewables", "renewables_total", [1, 7]),
+]
 # French inputs as (prefix, clean column, lag in days). France clears in the same coupled auction as
 # Germany, so its prices for day d are unknown at forecast time: only yesterday's prices are used.
+# No French renewables: RTE publishes its day-ahead wind and solar forecast after the auction.
 FRENCH_BLOCKS = [
     ("fr_price", "price", 1),
     ("fr_load", "load_forecast_winsorized", 0),
-    ("fr_renewables", "renewables_total", 0),
 ]
 LAGGED_PRICE_PREFIXES = ("price_lag", "fr_price_lag")
 
@@ -90,16 +94,16 @@ def build_day_table(hourly):
     blocks = [prices]
     for lag_days in PRICE_LAGS_DAYS:
         blocks.append(lagged_block(prices, "price", lag_days))
-    for prefix, column in FUNDAMENTAL_COLUMNS.items():
+    for prefix, column, lags_days in FUNDAMENTAL_BLOCKS:
         fundamentals = wide_by_hour(hourly, column, prefix)
-        for lag_days in FUNDAMENTAL_LAGS_DAYS:
+        for lag_days in lags_days:
             blocks.append(lagged_block(fundamentals, prefix, lag_days))
     blocks.append(weekday_dummies(prices.select("date")))
     return pl.concat(blocks, how="horizontal")
 
 
 def french_day_table():
-    """Return one row per date with the 72 French inputs: prices on d-1, load and renewables forecasts for d."""
+    """Return one row per date with the 48 French inputs: prices on d-1 and the load forecast for d."""
     hourly = pl.read_parquet(FRENCH_HOURLY_PATH)
     blocks = []
     dates = None
